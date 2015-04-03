@@ -18,6 +18,7 @@ import logging
 import re
 import six
 import warnings
+import json
 
 from cassandra.cqltypes import DateType
 from cassandra.encoder import cql_quote
@@ -352,6 +353,20 @@ class Text(Column):
             if len(value) < self.min_length:
                 raise ValidationError('{} is shorter than {} characters'.format(self.column_name, self.min_length))
         return value
+
+class JSON(Column):
+    db_type = 'text'
+
+    def to_python(self, value):
+        if value is None: return
+        if isinstance(value, basestring):
+            return json.loads(value)
+        else:
+            return value
+
+    def to_database(self, value):
+        if value is None: return
+        return json.dumps(value)
 
 
 class Integer(Column):
