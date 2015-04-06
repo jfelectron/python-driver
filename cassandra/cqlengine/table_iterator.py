@@ -1,5 +1,6 @@
 from cassandra import cqlengine
 
+
 class TableIterator(object):
     """
     Iterates over a Cassandra table defined by a cqlengine model class using query paging in order to pull back chunks
