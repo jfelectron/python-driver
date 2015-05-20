@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 import os
 from threading import Event
 import six
+from subprocess import call
 
 from itertools import groupby
 
@@ -118,9 +119,11 @@ else:
     log.info('Using Cassandra version: %s', CASSANDRA_VERSION)
     CCM_KWARGS['version'] = CASSANDRA_VERSION
 
-if CASSANDRA_VERSION > '2.1':
+if CASSANDRA_VERSION >= '2.2':
+    default_protocol_version = 4
+elif CASSANDRA_VERSION >= '2.1':
     default_protocol_version = 3
-elif CASSANDRA_VERSION > '2.0':
+elif CASSANDRA_VERSION >= '2.0':
     default_protocol_version = 2
 else:
     default_protocol_version = 1
@@ -195,17 +198,21 @@ def use_cluster(cluster_name, nodes, ipformat=None, start=True):
             log.debug("Creating new ccm %s cluster with %s", cluster_name, CCM_KWARGS)
             cluster = CCMCluster(path, cluster_name, **CCM_KWARGS)
             cluster.set_configuration_options({'start_native_transport': True})
+            if CASSANDRA_VERSION >= '2.2':
+                cluster.set_configuration_options({'enable_user_defined_functions': True})
             common.switch_cluster(path, cluster_name)
             cluster.populate(nodes, ipformat=ipformat)
 
         if start:
             log.debug("Starting ccm %s cluster", cluster_name)
             cluster.start(wait_for_binary_proto=True, wait_other_notice=True)
-            setup_test_keyspace()
+            setup_keyspace(ipformat=ipformat)
 
         CCM_CLUSTER = cluster
     except Exception:
-        log.exception("Failed to start ccm cluster:")
+        log.exception("Failed to start ccm cluster. Removing cluster.")
+        remove_cluster()
+        call(["pkill", "-9", "-f", ".ccm"])
         raise
 
 
@@ -225,14 +232,17 @@ def teardown_package():
                 log.exception('Failed to remove cluster: %s' % cluster_name)
 
         except Exception:
-            log.warn('Did not find cluster: %s' % cluster_name)
+            log.warning('Did not find cluster: %s' % cluster_name)
 
 
-def setup_test_keyspace():
+def setup_keyspace(ipformat=None):
     # wait for nodes to startup
     time.sleep(10)
 
-    cluster = Cluster(protocol_version=PROTOCOL_VERSION)
+    if not ipformat:
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
+    else:
+        cluster = Cluster(contact_points=["::1"], protocol_version=PROTOCOL_VERSION)
     session = cluster.connect()
 
     try:

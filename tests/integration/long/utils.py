@@ -133,27 +133,21 @@ def ring(node):
 def wait_for_up(cluster, node, wait=True):
     while True:
         host = cluster.metadata.get_host(IP_FORMAT % node)
-        time.sleep(0.1)
         if host and host.is_up:
-            # BUG: shouldn't have to, but we do
-            if wait:
-                log.debug("Sleeping 30s until host is up")
-                time.sleep(30)
             log.debug("Done waiting for node %s to be up", node)
             return
+        else:
+            log.debug("Host is still marked down, waiting")
+            time.sleep(1)
 
 
 def wait_for_down(cluster, node, wait=True):
     log.debug("Waiting for node %s to be down", node)
     while True:
         host = cluster.metadata.get_host(IP_FORMAT % node)
-        time.sleep(0.1)
         if not host or not host.is_up:
-            # BUG: shouldn't have to, but we do
-            if wait:
-                log.debug("Sleeping 10s until host is down")
-                time.sleep(10)
             log.debug("Done waiting for node %s to be down", node)
             return
         else:
             log.debug("Host is still marked up, waiting")
+            time.sleep(1)

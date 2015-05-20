@@ -40,7 +40,7 @@ def setup_module():
     ccm_cluster.start(wait_for_binary_proto=True, wait_other_notice=True)
     # there seems to be some race, with some versions of C* taking longer to 
     # get the auth (and default user) setup. Sleep here to give it a chance
-    time.sleep(2)
+    time.sleep(10)
 
 
 def teardown_module():
@@ -138,10 +138,22 @@ class SaslAuthenticatorTests(AuthenticationTests):
             raise unittest.SkipTest('pure-sasl is not installed')
 
     def get_authentication_provider(self, username, password):
-        sasl_kwargs = {'host': 'localhost',
-                       'service': 'cassandra',
+        sasl_kwargs = {'service': 'cassandra',
                        'mechanism': 'PLAIN',
                        'qops': ['auth'],
                        'username': username,
                        'password': password}
         return SaslAuthProvider(**sasl_kwargs)
+
+    # these could equally be unit tests
+    def test_host_passthrough(self):
+        sasl_kwargs = {'service': 'cassandra',
+                       'mechanism': 'PLAIN'}
+        provider = SaslAuthProvider(**sasl_kwargs)
+        host = 'thehostname'
+        authenticator = provider.new_authenticator(host)
+        self.assertEqual(authenticator.sasl.host, host)
+
+    def test_host_rejected(self):
+        sasl_kwargs = {'host': 'something'}
+        self.assertRaises(ValueError, SaslAuthProvider, **sasl_kwargs)

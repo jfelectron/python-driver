@@ -1,3 +1,13 @@
+2.5.1
+=====
+April 23, 2015
+
+Bug Fixes
+---------
+* Fix thread safety in DC-aware load balancing policy (PYTHON-297)
+* Fix race condition in node/token rebuild (PYTHON-298)
+* Set and send serial consistency parameter (PYTHON-299)
+
 2.5.0
 =====
 March 30, 2015
@@ -78,7 +88,6 @@ Bug Fixes
 ---------
 * Make execute_concurrent compatible with Python 2.6 (PYTHON-159)
 * Handle Unauthorized message on schema_triggers query (PYTHON-155)
-* Make execute_concurrent compatible with Python 2.6 (github-197)
 * Pure Python sorted set in support of UDTs nested in collections (PYTON-167)
 * Support CUSTOM index metadata and string export (PYTHON-165)
 

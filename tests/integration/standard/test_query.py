@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-
 from cassandra.concurrent import execute_concurrent
 
 
@@ -73,6 +72,21 @@ class QueryTests(unittest.TestCase):
 
         cluster.shutdown()
 
+    def test_trace_id_to_query(self):
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
+        session = cluster.connect()
+
+        query = "SELECT * FROM system.local"
+        statement = SimpleStatement(query)
+        self.assertIsNone(statement.trace_id)
+        future = session.execute_async(statement, trace=True)
+
+        # query should have trace_id, even before trace is obtained
+        future.result()
+        self.assertIsNotNone(statement.trace_id)
+
+        cluster.shutdown()
+
     def test_trace_ignores_row_factory(self):
         cluster = Cluster(protocol_version=PROTOCOL_VERSION)
         session = cluster.connect()
@@ -86,6 +100,51 @@ class QueryTests(unittest.TestCase):
         str(statement.trace)
         for event in statement.trace.events:
             str(event)
+
+        cluster.shutdown()
+
+    def test_client_ip_in_trace(self):
+        """
+        Test to validate that client trace contains client ip information.
+
+        creates a simple query and ensures that the client trace information is present. This will
+        only be the case if the c* version is 2.2 or greater
+
+        @since 2.6.0
+        @jira_ticket PYTHON-235
+        @expected_result client address should be present in C* >= 2.2, otherwise should be none.
+
+        @test_category tracing
+        #The current version on the trunk doesn't have the version set to 2.2 yet.
+        #For now we will use the protocol version. Once they update the version on C* trunk
+        #we can use the C*. See below
+        #self._cass_version, self._cql_version = get_server_versions()
+        #if self._cass_version < (2, 2):
+        #   raise unittest.SkipTest("Client IP was not present in trace until C* 2.2")
+        """
+
+        if PROTOCOL_VERSION < 4:
+            raise unittest.SkipTest(
+                "Protocol 4+ is required for client ip tracing, currently testing against %r"
+                % (PROTOCOL_VERSION,))
+
+        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
+        session = cluster.connect()
+
+        # Make simple query with trace enabled
+        query = "SELECT * FROM system.local"
+        statement = SimpleStatement(query)
+        response_future = session.execute_async(statement, trace=True)
+        response_future.result(timeout=10.0)
+        current_host = response_future._current_host.address
+
+        # Fetch the client_ip from the trace.
+        trace = response_future.get_query_trace(max_wait=2.0)
+        client_ip = trace.client
+
+        # Ensure that ip is set
+        self.assertIsNotNone(client_ip, "Client IP was not set in trace with C* >= 2.2")
+        self.assertEqual(client_ip, current_host, "Client IP from trace did not match the expected value")
 
         cluster.shutdown()
 
@@ -325,14 +384,22 @@ class SerialConsistencyTests(unittest.TestCase):
         statement = SimpleStatement(
             "UPDATE test3rf.test SET v=1 WHERE k=0 IF v=1",
             serial_consistency_level=ConsistencyLevel.SERIAL)
-        result = self.session.execute(statement)
+        # crazy test, but PYTHON-299
+        # TODO: expand to check more parameters get passed to statement, and on to messages
+        self.assertEqual(statement.serial_consistency_level, ConsistencyLevel.SERIAL)
+        future = self.session.execute_async(statement)
+        result = future.result()
+        self.assertEqual(future.message.serial_consistency_level, ConsistencyLevel.SERIAL)
         self.assertEqual(1, len(result))
         self.assertFalse(result[0].applied)
 
         statement = SimpleStatement(
             "UPDATE test3rf.test SET v=1 WHERE k=0 IF v=0",
-            serial_consistency_level=ConsistencyLevel.SERIAL)
-        result = self.session.execute(statement)
+            serial_consistency_level=ConsistencyLevel.LOCAL_SERIAL)
+        self.assertEqual(statement.serial_consistency_level, ConsistencyLevel.LOCAL_SERIAL)
+        future = self.session.execute_async(statement)
+        result = future.result()
+        self.assertEqual(future.message.serial_consistency_level, ConsistencyLevel.LOCAL_SERIAL)
         self.assertEqual(1, len(result))
         self.assertTrue(result[0].applied)
 
@@ -342,15 +409,39 @@ class SerialConsistencyTests(unittest.TestCase):
             "UPDATE test3rf.test SET v=1 WHERE k=0 IF v=2")
 
         statement.serial_consistency_level = ConsistencyLevel.SERIAL
-        result = self.session.execute(statement)
+        future = self.session.execute_async(statement)
+        result = future.result()
+        self.assertEqual(future.message.serial_consistency_level, ConsistencyLevel.SERIAL)
         self.assertEqual(1, len(result))
         self.assertFalse(result[0].applied)
 
         statement = self.session.prepare(
             "UPDATE test3rf.test SET v=1 WHERE k=0 IF v=0")
         bound = statement.bind(())
-        bound.serial_consistency_level = ConsistencyLevel.SERIAL
-        result = self.session.execute(statement)
+        bound.serial_consistency_level = ConsistencyLevel.LOCAL_SERIAL
+        future = self.session.execute_async(bound)
+        result = future.result()
+        self.assertEqual(future.message.serial_consistency_level, ConsistencyLevel.LOCAL_SERIAL)
+        self.assertEqual(1, len(result))
+        self.assertTrue(result[0].applied)
+
+    def test_conditional_update_with_batch_statements(self):
+        self.session.execute("INSERT INTO test3rf.test (k, v) VALUES (0, 0)")
+        statement = BatchStatement(serial_consistency_level=ConsistencyLevel.SERIAL)
+        statement.add("UPDATE test3rf.test SET v=1 WHERE k=0 IF v=1")
+        self.assertEqual(statement.serial_consistency_level, ConsistencyLevel.SERIAL)
+        future = self.session.execute_async(statement)
+        result = future.result()
+        self.assertEqual(future.message.serial_consistency_level, ConsistencyLevel.SERIAL)
+        self.assertEqual(1, len(result))
+        self.assertFalse(result[0].applied)
+
+        statement = BatchStatement(serial_consistency_level=ConsistencyLevel.LOCAL_SERIAL)
+        statement.add("UPDATE test3rf.test SET v=1 WHERE k=0 IF v=0")
+        self.assertEqual(statement.serial_consistency_level, ConsistencyLevel.LOCAL_SERIAL)
+        future = self.session.execute_async(statement)
+        result = future.result()
+        self.assertEqual(future.message.serial_consistency_level, ConsistencyLevel.LOCAL_SERIAL)
         self.assertEqual(1, len(result))
         self.assertTrue(result[0].applied)
 
@@ -410,15 +501,16 @@ class LightweightTransactionTests(unittest.TestCase):
         for (success, result) in results:
             if success:
                 continue
-            # In this case result is an exception
-            if type(result).__name__ == "NoHostAvailable":
-                self.fail("PYTHON-91: Disconnected from Cassandra: %s" % result.message)
-                break
-            if type(result).__name__ == "WriteTimeout":
-                received_timeout = True
-                continue
-            self.fail("Unexpected exception %s: %s" % (type(result).__name__, result.message))
-            break
+            else:
+                # In this case result is an exception
+                if type(result).__name__ == "NoHostAvailable":
+                    self.fail("PYTHON-91: Disconnected from Cassandra: %s" % result.message)
+                if type(result).__name__ == "WriteTimeout":
+                    received_timeout = True
+                    continue
+                if type(result).__name__ == "ReadTimeout":
+                    continue
+                self.fail("Unexpected exception %s: %s" % (type(result).__name__, result.message))
 
         # Make sure test passed
         self.assertTrue(received_timeout)

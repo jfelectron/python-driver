@@ -19,19 +19,25 @@ except ImportError:
 
 import difflib
 from mock import Mock
+import logging
 import six
 import sys
+import traceback
 
-from cassandra import AlreadyExists
+from cassandra import AlreadyExists, OperationTimedOut, SignatureDescriptor
 
 from cassandra.cluster import Cluster
-from cassandra.metadata import (Metadata, KeyspaceMetadata, TableMetadata,
-                                Token, MD5Token, TokenMap, murmur3)
+from cassandra.cqltypes import DoubleType, Int32Type, ListType, UTF8Type, MapType
+from cassandra.encoder import Encoder
+from cassandra.metadata import (Metadata, KeyspaceMetadata, TableMetadata, IndexMetadata,
+                                Token, MD5Token, TokenMap, murmur3, Function, Aggregate)
 from cassandra.policies import SimpleConvictionPolicy
 from cassandra.pool import Host
 
 from tests.integration import (get_cluster, use_singledc, PROTOCOL_VERSION,
                                get_server_versions)
+
+log = logging.getLogger(__name__)
 
 
 def setup_module():
@@ -46,47 +52,23 @@ class SchemaMetadataTests(unittest.TestCase):
     def cfname(self):
         return self._testMethodName.lower()
 
-    @classmethod
-    def setup_class(cls):
-        cluster = Cluster(protocol_version=PROTOCOL_VERSION)
-        session = cluster.connect()
-        try:
-            results = session.execute("SELECT keyspace_name FROM system.schema_keyspaces")
-            existing_keyspaces = [row[0] for row in results]
-            if cls.ksname in existing_keyspaces:
-                session.execute("DROP KEYSPACE %s" % cls.ksname)
-
-            session.execute(
-                """
-                CREATE KEYSPACE %s
-                WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'};
-                """ % cls.ksname)
-        finally:
-            cluster.shutdown()
-
-    @classmethod
-    def teardown_class(cls):
-        cluster = Cluster(['127.0.0.1'],
-                          protocol_version=PROTOCOL_VERSION)
-        session = cluster.connect()
-        try:
-            session.execute("DROP KEYSPACE %s" % cls.ksname)
-        finally:
-            cluster.shutdown()
-
     def setUp(self):
-        self.cluster = Cluster(['127.0.0.1'],
-                               protocol_version=PROTOCOL_VERSION)
+        self._cass_version, self._cql_version = get_server_versions()
+
+        self.cluster = Cluster(protocol_version=PROTOCOL_VERSION)
         self.session = self.cluster.connect()
+        self.session.execute("CREATE KEYSPACE schemametadatatest WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'}")
 
     def tearDown(self):
-        try:
-            self.session.execute(
-                """
-                DROP TABLE {ksname}.{cfname}
-                """.format(ksname=self.ksname, cfname=self.cfname))
-        finally:
-            self.cluster.shutdown()
+        while True:
+            try:
+                self.session.execute("DROP KEYSPACE schemametadatatest")
+                self.cluster.shutdown()
+                break
+            except OperationTimedOut:
+                ex_type, ex, tb = sys.exc_info()
+                log.warn("{0}: {1} Backtrace: {2}".format(ex_type.__name__, ex, traceback.extract_tb(tb)))
+                del tb
 
     def make_create_statement(self, partition_cols, clustering_cols=None, other_cols=None, compact=False):
         clustering_cols = clustering_cols or []
@@ -143,7 +125,6 @@ class SchemaMetadataTests(unittest.TestCase):
         self.cluster.control_connection.refresh_schema()
 
         meta = self.cluster.metadata
-        self.assertNotEqual(meta.cluster_ref, None)
         self.assertNotEqual(meta.cluster_name, None)
         self.assertTrue(self.ksname in meta.keyspaces)
         ksmeta = meta.keyspaces[self.ksname]
@@ -309,6 +290,9 @@ class SchemaMetadataTests(unittest.TestCase):
         self.assertIn('CREATE INDEX e_index', statement)
 
     def test_collection_indexes(self):
+        if get_server_versions()[0] < (2, 1, 0):
+            raise unittest.SkipTest("Secondary index on collections were introduced in Cassandra 2.1")
+
         self.session.execute("CREATE TABLE %s.%s (a int PRIMARY KEY, b map<text, text>)"
                              % (self.ksname, self.cfname))
         self.session.execute("CREATE INDEX index1 ON %s.%s (keys(b))"
@@ -390,7 +374,7 @@ class TestCodeCoverage(unittest.TestCase):
                 "Protocol 3.0+ is required for UDT change events, currently testing against %r"
                 % (PROTOCOL_VERSION,))
 
-        if sys.version_info[2:] != (2, 7):
+        if sys.version_info[0:2] != (2, 7):
             raise unittest.SkipTest('This test compares static strings generated from dict items, which may change orders. Test with 2.7.')
 
         cluster = Cluster(protocol_version=PROTOCOL_VERSION)
@@ -584,10 +568,14 @@ CREATE TABLE export_udts.users (
 
     def test_legacy_tables(self):
 
-        if get_server_versions()[0] < (2, 1, 0):
+        cass_ver = get_server_versions()[0]
+        if cass_ver < (2, 1, 0):
             raise unittest.SkipTest('Test schema output assumes 2.1.0+ options')
 
-        if sys.version_info[2:] != (2, 7):
+        if cass_ver >= (2, 2, 0):
+            raise unittest.SkipTest('Cannot test cli script on Cassandra 2.2.0+')
+
+        if sys.version_info[0:2] != (2, 7):
             raise unittest.SkipTest('This test compares static strings generated from dict items, which may change orders. Test with 2.7.')
 
         cli_script = """CREATE KEYSPACE legacy
@@ -928,3 +916,406 @@ class KeyspaceAlterMetadata(unittest.TestCase):
         new_keyspace_meta = self.cluster.metadata.keyspaces[name]
         self.assertNotEqual(original_keyspace_meta, new_keyspace_meta)
         self.assertEqual(new_keyspace_meta.durable_writes, False)
+
+
+class IndexMapTests(unittest.TestCase):
+
+    keyspace_name = 'index_map_tests'
+
+    @property
+    def table_name(self):
+        return self._testMethodName.lower()
+
+    @classmethod
+    def setup_class(cls):
+        cls.cluster = Cluster(protocol_version=PROTOCOL_VERSION)
+        cls.session = cls.cluster.connect()
+        try:
+            if cls.keyspace_name in cls.cluster.metadata.keyspaces:
+                cls.session.execute("DROP KEYSPACE %s" % cls.keyspace_name)
+
+            cls.session.execute(
+                """
+                CREATE KEYSPACE %s
+                WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'};
+                """ % cls.keyspace_name)
+            cls.session.set_keyspace(cls.keyspace_name)
+        except Exception:
+            cls.cluster.shutdown()
+            raise
+
+    @classmethod
+    def teardown_class(cls):
+        try:
+            cls.session.execute("DROP KEYSPACE %s" % cls.keyspace_name)
+        finally:
+            cls.cluster.shutdown()
+
+    def create_basic_table(self):
+        self.session.execute("CREATE TABLE %s (k int PRIMARY KEY, a int)" % self.table_name)
+
+    def drop_basic_table(self):
+        self.session.execute("DROP TABLE %s" % self.table_name)
+
+    def test_index_updates(self):
+        self.create_basic_table()
+
+        ks_meta = self.cluster.metadata.keyspaces[self.keyspace_name]
+        table_meta = ks_meta.tables[self.table_name]
+        self.assertNotIn('a_idx', ks_meta.indexes)
+        self.assertNotIn('b_idx', ks_meta.indexes)
+        self.assertNotIn('a_idx', table_meta.indexes)
+        self.assertNotIn('b_idx', table_meta.indexes)
+
+        self.session.execute("CREATE INDEX a_idx ON %s (a)" % self.table_name)
+        self.session.execute("ALTER TABLE %s ADD b int" % self.table_name)
+        self.session.execute("CREATE INDEX b_idx ON %s (b)" % self.table_name)
+
+        ks_meta = self.cluster.metadata.keyspaces[self.keyspace_name]
+        table_meta = ks_meta.tables[self.table_name]
+        self.assertIsInstance(ks_meta.indexes['a_idx'], IndexMetadata)
+        self.assertIsInstance(ks_meta.indexes['b_idx'], IndexMetadata)
+        self.assertIsInstance(table_meta.indexes['a_idx'], IndexMetadata)
+        self.assertIsInstance(table_meta.indexes['b_idx'], IndexMetadata)
+
+        # both indexes updated when index dropped
+        self.session.execute("DROP INDEX a_idx")
+
+        # temporarily synchronously refresh the schema metadata, until CASSANDRA-9391 is merged in
+        self.cluster.refresh_schema(self.keyspace_name, self.table_name)
+
+        ks_meta = self.cluster.metadata.keyspaces[self.keyspace_name]
+        table_meta = ks_meta.tables[self.table_name]
+        self.assertNotIn('a_idx', ks_meta.indexes)
+        self.assertIsInstance(ks_meta.indexes['b_idx'], IndexMetadata)
+        self.assertNotIn('a_idx', table_meta.indexes)
+        self.assertIsInstance(table_meta.indexes['b_idx'], IndexMetadata)
+
+        # keyspace index updated when table dropped
+        self.drop_basic_table()
+        ks_meta = self.cluster.metadata.keyspaces[self.keyspace_name]
+        self.assertNotIn(self.table_name, ks_meta.tables)
+        self.assertNotIn('a_idx', ks_meta.indexes)
+        self.assertNotIn('b_idx', ks_meta.indexes)
+
+    def test_index_follows_alter(self):
+        self.create_basic_table()
+
+        idx = self.table_name + '_idx'
+        self.session.execute("CREATE INDEX %s ON %s (a)" % (idx, self.table_name))
+        ks_meta = self.cluster.metadata.keyspaces[self.keyspace_name]
+        table_meta = ks_meta.tables[self.table_name]
+        self.assertIsInstance(ks_meta.indexes[idx], IndexMetadata)
+        self.assertIsInstance(table_meta.indexes[idx], IndexMetadata)
+        self.session.execute('ALTER KEYSPACE %s WITH durable_writes = false' % self.keyspace_name)
+        old_meta = ks_meta
+        ks_meta = self.cluster.metadata.keyspaces[self.keyspace_name]
+        self.assertIsNot(ks_meta, old_meta)
+        table_meta = ks_meta.tables[self.table_name]
+        self.assertIsInstance(ks_meta.indexes[idx], IndexMetadata)
+        self.assertIsInstance(table_meta.indexes[idx], IndexMetadata)
+        self.drop_basic_table()
+
+
+class FunctionTest(unittest.TestCase):
+    """
+    Base functionality for Function and Aggregate metadata test classes
+    """
+
+    def setUp(self):
+        """
+        Tests are skipped if run with native protocol version < 4
+        """
+
+        if PROTOCOL_VERSION < 4:
+            raise unittest.SkipTest("Function metadata requires native protocol version 4+")
+
+    @property
+    def function_name(self):
+        return self._testMethodName.lower()
+
+    @classmethod
+    def setup_class(cls):
+        if PROTOCOL_VERSION >= 4:
+            cls.cluster = Cluster(protocol_version=PROTOCOL_VERSION)
+            cls.keyspace_name = cls.__name__.lower()
+            cls.session = cls.cluster.connect()
+            cls.session.execute("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}" % cls.keyspace_name)
+            cls.session.set_keyspace(cls.keyspace_name)
+            cls.keyspace_function_meta = cls.cluster.metadata.keyspaces[cls.keyspace_name].functions
+            cls.keyspace_aggregate_meta = cls.cluster.metadata.keyspaces[cls.keyspace_name].aggregates
+
+    @classmethod
+    def teardown_class(cls):
+        if PROTOCOL_VERSION >= 4:
+            cls.session.execute("DROP KEYSPACE IF EXISTS %s" % cls.keyspace_name)
+            cls.cluster.shutdown()
+
+    class Verified(object):
+
+        def __init__(self, test_case, meta_class, element_meta, **function_kwargs):
+            self.test_case = test_case
+            self.function_kwargs = dict(function_kwargs)
+            self.meta_class = meta_class
+            self.element_meta = element_meta
+
+        def __enter__(self):
+            tc = self.test_case
+            expected_meta = self.meta_class(**self.function_kwargs)
+            tc.assertNotIn(expected_meta.signature, self.element_meta)
+            tc.session.execute(expected_meta.as_cql_query())
+            tc.assertIn(expected_meta.signature, self.element_meta)
+
+            generated_meta = self.element_meta[expected_meta.signature]
+            self.test_case.assertEqual(generated_meta.as_cql_query(), expected_meta.as_cql_query())
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            tc = self.test_case
+            tc.session.execute("DROP %s %s.%s" % (self.meta_class.__name__, tc.keyspace_name, self.signature))
+            tc.assertNotIn(self.signature, self.element_meta)
+
+        @property
+        def signature(self):
+            return SignatureDescriptor.format_signature(self.function_kwargs['name'],
+                                                        self.function_kwargs['type_signature'])
+
+    class VerifiedFunction(Verified):
+        def __init__(self, test_case, **kwargs):
+            super(FunctionTest.VerifiedFunction, self).__init__(test_case, Function, test_case.keyspace_function_meta, **kwargs)
+
+    class VerifiedAggregate(Verified):
+        def __init__(self, test_case, **kwargs):
+            super(FunctionTest.VerifiedAggregate, self).__init__(test_case, Aggregate, test_case.keyspace_aggregate_meta, **kwargs)
+
+
+class FunctionMetadata(FunctionTest):
+
+    def make_function_kwargs(self, called_on_null=True):
+        return {'keyspace': self.keyspace_name,
+                'name': self.function_name,
+                'type_signature': ['double', 'int'],
+                'argument_names': ['d', 'i'],
+                'return_type': DoubleType,
+                'language': 'java',
+                'body': 'return new Double(0.0);',
+                'called_on_null_input': called_on_null}
+
+    def test_functions_after_udt(self):
+        self.assertNotIn(self.function_name, self.keyspace_function_meta)
+
+        udt_name = 'udtx'
+        self.session.execute("CREATE TYPE %s (x int)" % udt_name)
+
+        # Ideally we would make a function that takes a udt type, but
+        # this presently fails because C* c059a56 requires udt to be frozen to create, but does not store meta indicating frozen
+        # https://issues.apache.org/jira/browse/CASSANDRA-9186
+        # Maybe update this after release
+        #kwargs = self.make_function_kwargs()
+        #kwargs['type_signature'][0] = "frozen<%s>" % udt_name
+
+        #expected_meta = Function(**kwargs)
+        #with self.VerifiedFunction(self, **kwargs):
+        with self.VerifiedFunction(self, **self.make_function_kwargs()):
+            # udts must come before functions in keyspace dump
+            keyspace_cql = self.cluster.metadata.keyspaces[self.keyspace_name].export_as_string()
+            type_idx = keyspace_cql.rfind("CREATE TYPE")
+            func_idx = keyspace_cql.find("CREATE FUNCTION")
+            self.assertNotIn(-1, (type_idx, func_idx), "TYPE or FUNCTION not found in keyspace_cql: " + keyspace_cql)
+            self.assertGreater(func_idx, type_idx)
+
+    def test_function_same_name_diff_types(self):
+        kwargs = self.make_function_kwargs()
+        with self.VerifiedFunction(self, **kwargs):
+            # another function: same name, different type sig.
+            self.assertGreater(len(kwargs['type_signature']), 1)
+            self.assertGreater(len(kwargs['argument_names']), 1)
+            kwargs['type_signature'] = kwargs['type_signature'][:1]
+            kwargs['argument_names'] = kwargs['argument_names'][:1]
+            with self.VerifiedFunction(self, **kwargs):
+                functions = [f for f in self.keyspace_function_meta.values() if f.name == self.function_name]
+                self.assertEqual(len(functions), 2)
+                self.assertNotEqual(functions[0].type_signature, functions[1].type_signature)
+
+    def test_functions_follow_keyspace_alter(self):
+        with self.VerifiedFunction(self, **self.make_function_kwargs()):
+            original_keyspace_meta = self.cluster.metadata.keyspaces[self.keyspace_name]
+            self.session.execute('ALTER KEYSPACE %s WITH durable_writes = false' % self.keyspace_name)
+            try:
+                new_keyspace_meta = self.cluster.metadata.keyspaces[self.keyspace_name]
+                self.assertNotEqual(original_keyspace_meta, new_keyspace_meta)
+                self.assertIs(original_keyspace_meta.functions, new_keyspace_meta.functions)
+            finally:
+                self.session.execute('ALTER KEYSPACE %s WITH durable_writes = true' % self.keyspace_name)
+
+    def test_function_cql_called_on_null(self):
+        kwargs = self.make_function_kwargs()
+        kwargs['called_on_null_input'] = True
+        with self.VerifiedFunction(self, **kwargs) as vf:
+            fn_meta = self.keyspace_function_meta[vf.signature]
+            self.assertRegexpMatches(fn_meta.as_cql_query(), "CREATE FUNCTION.*\) CALLED ON NULL INPUT RETURNS .*")
+
+        kwargs['called_on_null_input'] = False
+        with self.VerifiedFunction(self, **kwargs) as vf:
+            fn_meta = self.keyspace_function_meta[vf.signature]
+            self.assertRegexpMatches(fn_meta.as_cql_query(), "CREATE FUNCTION.*\) RETURNS NULL ON NULL INPUT RETURNS .*")
+
+
+class AggregateMetadata(FunctionTest):
+
+    @classmethod
+    def setup_class(cls):
+        if PROTOCOL_VERSION >= 4:
+            super(AggregateMetadata, cls).setup_class()
+
+            cls.session.execute("""CREATE OR REPLACE FUNCTION sum_int(s int, i int)
+                                   RETURNS NULL ON NULL INPUT
+                                   RETURNS int
+                                   LANGUAGE javascript AS 's + i';""")
+            cls.session.execute("""CREATE OR REPLACE FUNCTION sum_int_two(s int, i int, j int)
+                                   RETURNS NULL ON NULL INPUT
+                                   RETURNS int
+                                   LANGUAGE javascript AS 's + i + j';""")
+            cls.session.execute("""CREATE OR REPLACE FUNCTION "List_As_String"(l list<text>)
+                                   RETURNS NULL ON NULL INPUT
+                                   RETURNS int
+                                   LANGUAGE javascript AS ''''' + l';""")
+            cls.session.execute("""CREATE OR REPLACE FUNCTION extend_list(s list<text>, i int)
+                                   CALLED ON NULL INPUT
+                                   RETURNS list<text>
+                                   LANGUAGE java AS 'if (i != null) s.add(i.toString()); return s;';""")
+            cls.session.execute("""CREATE OR REPLACE FUNCTION update_map(s map<int, int>, i int)
+                                   RETURNS NULL ON NULL INPUT
+                                   RETURNS map<int, int>
+                                   LANGUAGE java AS 's.put(new Integer(i), new Integer(i)); return s;';""")
+            cls.session.execute("""CREATE TABLE IF NOT EXISTS t
+                                   (k int PRIMARY KEY, v int)""")
+            for x in range(4):
+                cls.session.execute("INSERT INTO t (k,v) VALUES (%s, %s)", (x, x))
+            cls.session.execute("INSERT INTO t (k) VALUES (%s)", (4,))
+
+    def make_aggregate_kwargs(self, state_func, state_type, final_func=None, init_cond=None):
+        return {'keyspace': self.keyspace_name,
+                'name': self.function_name + '_aggregate',
+                'type_signature': ['int'],
+                'state_func': state_func,
+                'state_type': state_type,
+                'final_func': final_func,
+                'initial_condition': init_cond,
+                'return_type': "does not matter for creation"}
+
+    def test_return_type_meta(self):
+        with self.VerifiedAggregate(self, **self.make_aggregate_kwargs('sum_int', Int32Type, init_cond=1)) as va:
+            self.assertIs(self.keyspace_aggregate_meta[va.signature].return_type, Int32Type)
+
+    def test_init_cond(self):
+        # This is required until the java driver bundled with C* is updated to support v4
+        c = Cluster(protocol_version=3)
+        s = c.connect(self.keyspace_name)
+
+        expected_values = range(4)
+
+        # int32
+        for init_cond in (-1, 0, 1):
+            with self.VerifiedAggregate(self, **self.make_aggregate_kwargs('sum_int', Int32Type, init_cond=init_cond)) as va:
+                sum_res = s.execute("SELECT %s(v) AS sum FROM t" % va.function_kwargs['name'])[0].sum
+                self.assertEqual(sum_res, init_cond + sum(expected_values))
+
+        # list<text>
+        for init_cond in ([], ['1', '2']):
+            with self.VerifiedAggregate(self, **self.make_aggregate_kwargs('extend_list', ListType.apply_parameters([UTF8Type]), init_cond=init_cond)) as va:
+                list_res = s.execute("SELECT %s(v) AS list_res FROM t" % va.function_kwargs['name'])[0].list_res
+                self.assertListEqual(list_res[:len(init_cond)], init_cond)
+                self.assertEqual(set(i for i in list_res[len(init_cond):]),
+                                 set(str(i) for i in expected_values))
+
+        # map<int,int>
+        expected_map_values = dict((i, i) for i in expected_values)
+        expected_key_set = set(expected_values)
+        for init_cond in ({}, {1: 2, 3: 4}, {5: 5}):
+            with self.VerifiedAggregate(self, **self.make_aggregate_kwargs('update_map', MapType.apply_parameters([Int32Type, Int32Type]), init_cond=init_cond)) as va:
+                map_res = s.execute("SELECT %s(v) AS map_res FROM t" % va.function_kwargs['name'])[0].map_res
+                self.assertDictContainsSubset(expected_map_values, map_res)
+                init_not_updated = dict((k, init_cond[k]) for k in set(init_cond) - expected_key_set)
+                self.assertDictContainsSubset(init_not_updated, map_res)
+        c.shutdown()
+
+    def test_aggregates_after_functions(self):
+        # functions must come before functions in keyspace dump
+        with self.VerifiedAggregate(self, **self.make_aggregate_kwargs('extend_list', ListType.apply_parameters([UTF8Type]))):
+            keyspace_cql = self.cluster.metadata.keyspaces[self.keyspace_name].export_as_string()
+            func_idx = keyspace_cql.find("CREATE FUNCTION")
+            aggregate_idx = keyspace_cql.rfind("CREATE AGGREGATE")
+            self.assertNotIn(-1, (aggregate_idx, func_idx), "AGGREGATE or FUNCTION not found in keyspace_cql: " + keyspace_cql)
+            self.assertGreater(aggregate_idx, func_idx)
+
+    def test_same_name_diff_types(self):
+        kwargs = self.make_aggregate_kwargs('sum_int', Int32Type, init_cond=0)
+        with self.VerifiedAggregate(self, **kwargs):
+            kwargs['state_func'] = 'sum_int_two'
+            kwargs['type_signature'] = ['int', 'int']
+            with self.VerifiedAggregate(self, **kwargs):
+                aggregates = [a for a in self.keyspace_aggregate_meta.values() if a.name == kwargs['name']]
+                self.assertEqual(len(aggregates), 2)
+                self.assertNotEqual(aggregates[0].type_signature, aggregates[1].type_signature)
+
+    def test_aggregates_follow_keyspace_alter(self):
+        with self.VerifiedAggregate(self, **self.make_aggregate_kwargs('sum_int', Int32Type, init_cond=0)):
+            original_keyspace_meta = self.cluster.metadata.keyspaces[self.keyspace_name]
+            self.session.execute('ALTER KEYSPACE %s WITH durable_writes = false' % self.keyspace_name)
+            try:
+                new_keyspace_meta = self.cluster.metadata.keyspaces[self.keyspace_name]
+                self.assertNotEqual(original_keyspace_meta, new_keyspace_meta)
+                self.assertIs(original_keyspace_meta.aggregates, new_keyspace_meta.aggregates)
+            finally:
+                self.session.execute('ALTER KEYSPACE %s WITH durable_writes = true' % self.keyspace_name)
+
+    def test_cql_optional_params(self):
+        kwargs = self.make_aggregate_kwargs('extend_list', ListType.apply_parameters([UTF8Type]))
+
+        # no initial condition, final func
+        self.assertIsNone(kwargs['initial_condition'])
+        self.assertIsNone(kwargs['final_func'])
+        with self.VerifiedAggregate(self, **kwargs) as va:
+            meta = self.keyspace_aggregate_meta[va.signature]
+            self.assertIsNone(meta.initial_condition)
+            self.assertIsNone(meta.final_func)
+            cql = meta.as_cql_query()
+            self.assertEqual(cql.find('INITCOND'), -1)
+            self.assertEqual(cql.find('FINALFUNC'), -1)
+
+        # initial condition, no final func
+        kwargs['initial_condition'] = ['init', 'cond']
+        with self.VerifiedAggregate(self, **kwargs) as va:
+            meta = self.keyspace_aggregate_meta[va.signature]
+            self.assertListEqual(meta.initial_condition, kwargs['initial_condition'])
+            self.assertIsNone(meta.final_func)
+            cql = meta.as_cql_query()
+            search_string = "INITCOND %s" % Encoder().cql_encode_all_types(kwargs['initial_condition'])
+            self.assertGreater(cql.find(search_string), 0, '"%s" search string not found in cql:\n%s' % (search_string, cql))
+            self.assertEqual(cql.find('FINALFUNC'), -1)
+
+        # no initial condition, final func
+        kwargs['initial_condition'] = None
+        kwargs['final_func'] = 'List_As_String'
+        with self.VerifiedAggregate(self, **kwargs) as va:
+            meta = self.keyspace_aggregate_meta[va.signature]
+            self.assertIsNone(meta.initial_condition)
+            self.assertEqual(meta.final_func, kwargs['final_func'])
+            cql = meta.as_cql_query()
+            self.assertEqual(cql.find('INITCOND'), -1)
+            search_string = 'FINALFUNC "%s"' % kwargs['final_func']
+            self.assertGreater(cql.find(search_string), 0, '"%s" search string not found in cql:\n%s' % (search_string, cql))
+
+        # both
+        kwargs['initial_condition'] = ['init', 'cond']
+        kwargs['final_func'] = 'List_As_String'
+        with self.VerifiedAggregate(self, **kwargs) as va:
+            meta = self.keyspace_aggregate_meta[va.signature]
+            self.assertListEqual(meta.initial_condition, kwargs['initial_condition'])
+            self.assertEqual(meta.final_func, kwargs['final_func'])
+            cql = meta.as_cql_query()
+            init_cond_idx = cql.find("INITCOND %s" % Encoder().cql_encode_all_types(kwargs['initial_condition']))
+            final_func_idx = cql.find('FINALFUNC "%s"' % kwargs['final_func'])
+            self.assertNotIn(-1, (init_cond_idx, final_func_idx))
+            self.assertGreater(init_cond_idx, final_func_idx)

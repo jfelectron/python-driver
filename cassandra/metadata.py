@@ -19,9 +19,9 @@ from itertools import islice, cycle
 import json
 import logging
 import re
-from threading import RLock
-import weakref
 import six
+from six.moves import zip
+from threading import RLock
 
 murmur3 = None
 try:
@@ -29,9 +29,10 @@ try:
 except ImportError as e:
     pass
 
+from cassandra import SignatureDescriptor
 import cassandra.cqltypes as types
+from cassandra.encoder import Encoder
 from cassandra.marshal import varint_unpack
-from cassandra.pool import Host
 from cassandra.util import OrderedDict
 
 log = logging.getLogger(__name__)
@@ -72,11 +73,7 @@ class Metadata(object):
     token_map = None
     """ A :class:`~.TokenMap` instance describing the ring topology. """
 
-    def __init__(self, cluster):
-        # use a weak reference so that the Cluster object can be GC'ed.
-        # Normally the cycle detector would handle this, but implementing
-        # __del__ disables that.
-        self.cluster_ref = weakref.ref(cluster)
+    def __init__(self):
         self.keyspaces = {}
         self._hosts = {}
         self._hosts_lock = RLock()
@@ -88,7 +85,8 @@ class Metadata(object):
         """
         return "\n".join(ks.export_as_string() for ks in self.keyspaces.values())
 
-    def rebuild_schema(self, ks_results, type_results, cf_results, col_results, triggers_result):
+    def rebuild_schema(self, ks_results, type_results, function_results,
+                       aggregate_results, cf_results, col_results, triggers_result):
         """
         Rebuild the view of the current schema from a fresh set of rows from
         the system schema tables.
@@ -98,6 +96,8 @@ class Metadata(object):
         cf_def_rows = defaultdict(list)
         col_def_rows = defaultdict(lambda: defaultdict(list))
         usertype_rows = defaultdict(list)
+        fn_rows = defaultdict(list)
+        agg_rows = defaultdict(list)
         trigger_rows = defaultdict(lambda: defaultdict(list))
 
         for row in cf_results:
@@ -111,6 +111,12 @@ class Metadata(object):
         for row in type_results:
             usertype_rows[row["keyspace_name"]].append(row)
 
+        for row in function_results:
+            fn_rows[row["keyspace_name"]].append(row)
+
+        for row in aggregate_results:
+            agg_rows[row["keyspace_name"]].append(row)
+
         for row in triggers_result:
             ksname = row["keyspace_name"]
             cfname = row["columnfamily_name"]
@@ -122,14 +128,20 @@ class Metadata(object):
             keyspace_col_rows = col_def_rows.get(keyspace_meta.name, {})
             keyspace_trigger_rows = trigger_rows.get(keyspace_meta.name, {})
             for table_row in cf_def_rows.get(keyspace_meta.name, []):
-                table_meta = self._build_table_metadata(
-                    keyspace_meta, table_row, keyspace_col_rows,
-                    keyspace_trigger_rows)
-                keyspace_meta.tables[table_meta.name] = table_meta
+                table_meta = self._build_table_metadata(keyspace_meta, table_row, keyspace_col_rows, keyspace_trigger_rows)
+                keyspace_meta._add_table_metadata(table_meta)
 
             for usertype_row in usertype_rows.get(keyspace_meta.name, []):
                 usertype = self._build_usertype(keyspace_meta.name, usertype_row)
                 keyspace_meta.user_types[usertype.name] = usertype
+
+            for fn_row in fn_rows.get(keyspace_meta.name, []):
+                fn = self._build_function(keyspace_meta.name, fn_row)
+                keyspace_meta.functions[fn.signature] = fn
+
+            for agg_row in agg_rows.get(keyspace_meta.name, []):
+                agg = self._build_aggregate(keyspace_meta.name, agg_row)
+                keyspace_meta.aggregates[agg.signature] = agg
 
             current_keyspaces.add(keyspace_meta.name)
             old_keyspace_meta = self.keyspaces.get(keyspace_meta.name, None)
@@ -140,8 +152,8 @@ class Metadata(object):
                 self._keyspace_added(keyspace_meta.name)
 
         # remove not-just-added keyspaces
-        removed_keyspaces = [ksname for ksname in self.keyspaces.keys()
-                             if ksname not in current_keyspaces]
+        removed_keyspaces = [name for name in self.keyspaces.keys()
+                             if name not in current_keyspaces]
         self.keyspaces = dict((name, meta) for name, meta in self.keyspaces.items()
                               if name in current_keyspaces)
         for ksname in removed_keyspaces:
@@ -160,6 +172,9 @@ class Metadata(object):
         if old_keyspace_meta:
             keyspace_meta.tables = old_keyspace_meta.tables
             keyspace_meta.user_types = old_keyspace_meta.user_types
+            keyspace_meta.indexes = old_keyspace_meta.indexes
+            keyspace_meta.functions = old_keyspace_meta.functions
+            keyspace_meta.aggregates = old_keyspace_meta.aggregates
             if (keyspace_meta.replication_strategy != old_keyspace_meta.replication_strategy):
                 self._keyspace_updated(keyspace)
         else:
@@ -173,6 +188,22 @@ class Metadata(object):
             # the type was deleted
             self.keyspaces[keyspace].user_types.pop(name, None)
 
+    def function_changed(self, keyspace, function, function_results):
+        if function_results:
+            new_function = self._build_function(keyspace, function_results[0])
+            self.keyspaces[keyspace].functions[function.signature] = new_function
+        else:
+            # the function was deleted
+            self.keyspaces[keyspace].functions.pop(function.signature, None)
+
+    def aggregate_changed(self, keyspace, aggregate, aggregate_results):
+        if aggregate_results:
+            new_aggregate = self._build_aggregate(keyspace, aggregate_results[0])
+            self.keyspaces[keyspace].aggregates[aggregate.signature] = new_aggregate
+        else:
+            # the aggregate was deleted
+            self.keyspaces[keyspace].aggregates.pop(aggregate.signature, None)
+
     def table_changed(self, keyspace, table, cf_results, col_results, triggers_result):
         try:
             keyspace_meta = self.keyspaces[keyspace]
@@ -184,12 +215,11 @@ class Metadata(object):
 
         if not cf_results:
             # the table was removed
-            keyspace_meta.tables.pop(table, None)
+            keyspace_meta._drop_table_metadata(table)
         else:
             assert len(cf_results) == 1
-            keyspace_meta.tables[table] = self._build_table_metadata(
-                keyspace_meta, cf_results[0], {table: col_results},
-                {table: triggers_result})
+            table_meta = self._build_table_metadata(keyspace_meta, cf_results[0], {table: col_results}, {table: triggers_result})
+            keyspace_meta._add_table_metadata(table_meta)
 
     def _keyspace_added(self, ksname):
         if self.token_map:
@@ -214,6 +244,23 @@ class Metadata(object):
         type_classes = list(map(types.lookup_casstype, usertype_row['field_types']))
         return UserType(usertype_row['keyspace_name'], usertype_row['type_name'],
                         usertype_row['field_names'], type_classes)
+
+    def _build_function(self, keyspace, function_row):
+        return_type = types.lookup_casstype(function_row['return_type'])
+        return Function(function_row['keyspace_name'], function_row['function_name'],
+                        function_row['signature'], function_row['argument_names'],
+                        return_type, function_row['language'], function_row['body'],
+                        function_row['called_on_null_input'])
+
+    def _build_aggregate(self, keyspace, aggregate_row):
+        state_type = types.lookup_casstype(aggregate_row['state_type'])
+        initial_condition = aggregate_row['initcond']
+        if initial_condition is not None:
+            initial_condition = state_type.deserialize(initial_condition, 3)
+        return_type = types.lookup_casstype(aggregate_row['return_type'])
+        return Aggregate(aggregate_row['keyspace_name'], aggregate_row['aggregate_name'],
+                         aggregate_row['signature'], aggregate_row['state_func'], state_type,
+                         aggregate_row['final_func'], initial_condition, return_type)
 
     def _build_table_metadata(self, keyspace_metadata, row, col_rows, trigger_rows):
         cfname = row["columnfamily_name"]
@@ -385,6 +432,8 @@ class Metadata(object):
         column_meta = ColumnMetadata(table_metadata, name, data_type, is_static=is_static)
         index_meta = self._build_index_metadata(column_meta, row)
         column_meta.index = index_meta
+        if index_meta:
+            table_metadata.indexes[index_meta.name] = index_meta
         return column_meta
 
     def _build_index_metadata(self, column_metadata, row):
@@ -451,17 +500,19 @@ class Metadata(object):
         else:
             return True
 
-    def add_host(self, address, datacenter, rack):
-        cluster = self.cluster_ref()
+    def add_or_return_host(self, host):
+        """
+        Returns a tuple (host, new), where ``host`` is a Host
+        instance, and ``new`` is a bool indicating whether
+        the host was newly added.
+        """
         with self._hosts_lock:
-            if address not in self._hosts:
-                new_host = Host(
-                    address, cluster.conviction_policy_factory, datacenter, rack)
-                self._hosts[address] = new_host
-            else:
-                return None
+            try:
+                return self._hosts[host.address], False
+            except KeyError:
+                self._hosts[host.address] = host
+                return host, True
 
-        return new_host
 
     def remove_host(self, host):
         with self._hosts_lock:
@@ -733,26 +784,51 @@ class KeyspaceMetadata(object):
     A map from table names to instances of :class:`~.TableMetadata`.
     """
 
+    indexes = None
+    """
+    A dict mapping index names to :class:`.IndexMetadata` instances.
+    """
+
     user_types = None
     """
-    A map from user-defined type names to instances of :class:`~cassandra.metadata..UserType`.
+    A map from user-defined type names to instances of :class:`~cassandra.metadata.UserType`.
 
     .. versionadded:: 2.1.0
     """
 
+    functions = None
+    """
+    A map from user-defined function signatures to instances of :class:`~cassandra.metadata.Function`.
+
+    .. versionadded:: 2.6.0
+    """
+
+    aggregates = None
+    """
+    A map from user-defined aggregate signatures to instances of :class:`~cassandra.metadata.Aggregate`.
+
+    .. versionadded:: 2.6.0
+    """
     def __init__(self, name, durable_writes, strategy_class, strategy_options):
         self.name = name
         self.durable_writes = durable_writes
         self.replication_strategy = ReplicationStrategy.create(strategy_class, strategy_options)
         self.tables = {}
+        self.indexes = {}
         self.user_types = {}
+        self.functions = {}
+        self.aggregates = {}
 
     def export_as_string(self):
         """
         Returns a CQL query string that can be used to recreate the entire keyspace,
         including user-defined types and tables.
         """
-        return "\n\n".join([self.as_cql_query()] + self.user_type_strings() + [t.export_as_string() for t in self.tables.values()])
+        return "\n\n".join([self.as_cql_query()]
+                           + self.user_type_strings()
+                           + [f.as_cql_query(True) for f in self.functions.values()]
+                           + [a.as_cql_query(True) for a in self.aggregates.values()]
+                           + [t.export_as_string() for t in self.tables.values()])
 
     def as_cql_query(self):
         """
@@ -780,6 +856,18 @@ class KeyspaceMetadata(object):
                 self.resolve_user_types(field_type.typename, types, user_type_strings)
         user_type_strings.append(user_type.as_cql_query(formatted=True))
 
+    def _add_table_metadata(self, table_metadata):
+        self._drop_table_metadata(table_metadata.name)
+
+        self.tables[table_metadata.name] = table_metadata
+        for index_name, index_metadata in six.iteritems(table_metadata.indexes):
+            self.indexes[index_name] = index_metadata
+
+    def _drop_table_metadata(self, table_name):
+        table_meta = self.tables.pop(table_name, None)
+        if table_meta:
+            for index_name in table_meta.indexes:
+                self.indexes.pop(index_name, None)
 
 class UserType(object):
     """
@@ -843,6 +931,182 @@ class UserType(object):
         return ret
 
 
+class Aggregate(object):
+    """
+    A user defined aggregate function, as created by ``CREATE AGGREGATE`` statements.
+
+    Aggregate functions were introduced in Cassandra 2.2
+
+    .. versionadded:: 2.6.0
+    """
+
+    keyspace = None
+    """
+    The string name of the keyspace in which this aggregate is defined
+    """
+
+    name = None
+    """
+    The name of this aggregate
+    """
+
+    type_signature = None
+    """
+    An ordered list of the types for each argument to the aggregate
+    """
+
+    final_func = None
+    """
+    Name of a final function
+    """
+
+    initial_condition = None
+    """
+    Initial condition of the aggregate
+    """
+
+    return_type = None
+    """
+    Return type of the aggregate
+    """
+
+    state_func = None
+    """
+    Name of a state function
+    """
+
+    state_type = None
+    """
+    Type of the aggregate state
+    """
+
+    def __init__(self, keyspace, name, type_signature, state_func,
+                 state_type, final_func, initial_condition, return_type):
+        self.keyspace = keyspace
+        self.name = name
+        self.type_signature = type_signature
+        self.state_func = state_func
+        self.state_type = state_type
+        self.final_func = final_func
+        self.initial_condition = initial_condition
+        self.return_type = return_type
+
+    def as_cql_query(self, formatted=False):
+        """
+        Returns a CQL query that can be used to recreate this aggregate.
+        If `formatted` is set to :const:`True`, extra whitespace will
+        be added to make the query more readable.
+        """
+        sep = '\n' if formatted else ' '
+        keyspace = protect_name(self.keyspace)
+        name = protect_name(self.name)
+        type_list = ', '.join(self.type_signature)
+        state_func = protect_name(self.state_func)
+        state_type = self.state_type.cql_parameterized_type()
+
+        ret = "CREATE AGGREGATE %(keyspace)s.%(name)s(%(type_list)s)%(sep)s" \
+              "SFUNC %(state_func)s%(sep)s" \
+              "STYPE %(state_type)s" % locals()
+
+        ret += ''.join((sep, 'FINALFUNC ', protect_name(self.final_func))) if self.final_func else ''
+        ret += ''.join((sep, 'INITCOND ', Encoder().cql_encode_all_types(self.initial_condition)))\
+               if self.initial_condition is not None else ''
+
+        return ret
+
+    @property
+    def signature(self):
+        return SignatureDescriptor.format_signature(self.name, self.type_signature)
+
+
+class Function(object):
+    """
+    A user defined function, as created by ``CREATE FUNCTION`` statements.
+
+    User-defined functions were introduced in Cassandra 2.2
+
+    .. versionadded:: 2.6.0
+    """
+
+    keyspace = None
+    """
+    The string name of the keyspace in which this function is defined
+    """
+
+    name = None
+    """
+    The name of this function
+    """
+
+    type_signature = None
+    """
+    An ordered list of the types for each argument to the function
+    """
+
+    arguemnt_names = None
+    """
+    An ordered list of the names of each argument to the function
+    """
+
+    return_type = None
+    """
+    Return type of the function
+    """
+
+    language = None
+    """
+    Language of the function body
+    """
+
+    body = None
+    """
+    Function body string
+    """
+
+    called_on_null_input = None
+    """
+    Flag indicating whether this function should be called for rows with null values
+    (convenience function to avoid handling nulls explicitly if the result will just be null)
+    """
+
+    def __init__(self, keyspace, name, type_signature, argument_names,
+                 return_type, language, body, called_on_null_input):
+        self.keyspace = keyspace
+        self.name = name
+        self.type_signature = type_signature
+        self.argument_names = argument_names
+        self.return_type = return_type
+        self.language = language
+        self.body = body
+        self.called_on_null_input = called_on_null_input
+
+    def as_cql_query(self, formatted=False):
+        """
+        Returns a CQL query that can be used to recreate this function.
+        If `formatted` is set to :const:`True`, extra whitespace will
+        be added to make the query more readable.
+        """
+        sep = '\n' if formatted else ' '
+        keyspace = protect_name(self.keyspace)
+        name = protect_name(self.name)
+        arg_list = ', '.join(["%s %s" % (protect_name(n), t)
+                             for n, t in zip(self.argument_names, self.type_signature)])
+        typ = self.return_type.cql_parameterized_type()
+        lang = self.language
+        body = protect_value(self.body)
+        on_null = "CALLED" if self.called_on_null_input else "RETURNS NULL"
+
+        return "CREATE FUNCTION %(keyspace)s.%(name)s(%(arg_list)s)%(sep)s" \
+               "%(on_null)s ON NULL INPUT%(sep)s" \
+               "RETURNS %(typ)s%(sep)s" \
+               "LANGUAGE %(lang)s%(sep)s" \
+               "AS %(body)s;" % locals()
+
+    @property
+    def signature(self):
+        return SignatureDescriptor.format_signature(self.name, self.type_signature)
+
+
 class TableMetadata(object):
     """
     A representation of the schema for a single table.
@@ -882,6 +1146,11 @@ class TableMetadata(object):
     columns = None
     """
     A dict mapping column names to :class:`.ColumnMetadata` instances.
+    """
+
+    indexes = None
+    """
+    A dict mapping index names to :class:`.IndexMetadata` instances.
     """
 
     is_compact_storage = False
@@ -945,6 +1214,7 @@ class TableMetadata(object):
         self.partition_key = [] if partition_key is None else partition_key
         self.clustering_key = [] if clustering_key is None else clustering_key
         self.columns = OrderedDict() if columns is None else columns
+        self.indexes = {}
         self.options = options
         self.comparator = None
         self.triggers = OrderedDict() if triggers is None else triggers
@@ -1241,6 +1511,12 @@ class IndexMetadata(object):
                 protect_name(table.name),
                 protect_name(self.column.name),
                 self.index_options["class_name"])
+
+    def export_as_string(self):
+        """
+        Returns a CQL query string that can be used to recreate this index.
+        """
+        return self.as_cql_query() + ';'
 
 
 class TokenMap(object):

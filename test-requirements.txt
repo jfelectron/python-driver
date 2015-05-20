@@ -8,3 +8,5 @@ unittest2
 PyYAML
 pytz
 sure
+pure-sasl
+twisted
