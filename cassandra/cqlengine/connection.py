@@ -127,6 +127,7 @@ def setup(
     cluster = Cluster(hosts, **kwargs)
     try:
         session = cluster.connect()
+        session.default_timeout  = 60.0
         log.debug("cqlengine connection initialized with internally created session")
     except NoHostAvailable:
         if retry_connect:
