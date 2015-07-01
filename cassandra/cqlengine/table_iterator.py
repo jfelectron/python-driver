@@ -107,7 +107,7 @@ class TableIterator(object):
         # current partition we are looking at.
 
         # Generate the partition key token for the last seen object.
-        token = cqlengine.Token(previous_object.pk)
+        token = cqlengine.functions.Token(previous_object.pk)
 
         # Create a where clause for the partition key token.
         pk_token_where = self.generate_where_clause_key('pk__token', 'gt')
