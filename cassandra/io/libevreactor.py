@@ -121,10 +121,13 @@ class LibevLoop(object):
 
         for conn in self._live_conns | self._new_conns | self._closed_conns:
             conn.close()
-            if conn._write_watcher:
-                conn._write_watcher.stop()
-            if conn._read_watcher:
-                conn._read_watcher.stop()
+            try:
+                if conn._write_watcher:
+                    conn._write_watcher.stop()
+                if conn._read_watcher:
+                    conn._read_watcher.stop()
+            except AttributeError:
+                pass
 
         self.notify()  # wake the timer watcher
         log.debug("Waiting for event loop thread to join...")
